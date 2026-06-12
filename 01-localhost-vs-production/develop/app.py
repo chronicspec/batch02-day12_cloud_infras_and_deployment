@@ -5,6 +5,13 @@
 Hãy đếm bao nhiêu vấn đề bạn tìm được trong file này.
 """
 import os
+import sys
+
+# Force UTF-8 encoding for stdout/stderr to prevent encoding errors on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 from fastapi import FastAPI
 import uvicorn
