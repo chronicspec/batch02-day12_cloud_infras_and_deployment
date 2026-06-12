@@ -338,6 +338,7 @@ cd ../render
 7. Deploy!
 
 **Nhiệm vụ:** So sánh `render.yaml` với `railway.toml`. Khác nhau gì?
+render.yaml sử dụng cấu hình YAML thuần túy cho từng service riêng biệt, còn railway.toml dùng cấu trúc "mở rộng" (extensible) với các trường như services, templates, và pipelines. render.yaml có cấu trúc đơn giản, dễ đọc, phù hợp với các dự án nhỏ và vừa.
 
 ### Exercise 3.3: (Optional) GCP Cloud Run (15 phút)
 
@@ -379,8 +380,13 @@ cd ../../04-api-gateway/develop
 **Nhiệm vụ:** Đọc `app.py` và tìm:
 
 - API key được check ở đâu?
+Tại api_key_required là một decorator, được định nghĩa trong file security.py. Hàm này hoạt động như một middleware (trung gian) của FastAPI. Khi có request tới, nó sẽ kiểm tra xem header X-API-Key có khớp với AGENT_API_KEY đã cấu hình trong biến môi trường không. Nếu không khớp, nó sẽ trả về lỗi 401 Unauthorized ngay lập tức trước khi request kịp tới endpoint /ask.
+
 - Điều gì xảy ra nếu sai key?
+Trả về lỗi 401 Unauthorized.
+
 - Làm sao rotate key?
+Đổi giá trị biến môi trường AGENT_API_KEY trên môi trường deployment (Railway, Render...). Khi container khởi động lại, nó sẽ tự load key mới.
 
 Test:
 
@@ -433,8 +439,13 @@ curl http://localhost:8000/ask -X POST \
 **Nhiệm vụ:** Đọc `rate_limiter.py` và trả lời:
 
 - Algorithm nào được dùng? (Token bucket? Sliding window?)
+Token bucket
+
 - Limit là bao nhiêu requests/minute?
+60 requests/minute.
+
 - Làm sao bypass limit cho admin?
+Trong hàm rate_limit_required, nếu user là admin thì nó return True luôn, không kiểm tra gì hết.
 
 Test:
 
@@ -527,15 +538,23 @@ cd ../../05-scaling-reliability/develop
 @app.get("/health")
 def health():
     """Liveness probe — container còn sống không?"""
-    # TODO: Return 200 nếu process OK
-    pass
+    return {"status": "ok"}
 
 @app.get("/ready")
 def ready():
     """Readiness probe — sẵn sàng nhận traffic không?"""
-    # TODO: Check database connection, Redis, etc.
-    # Return 200 nếu OK, 503 nếu chưa ready
-    pass
+    try:
+        # Check Redis
+        r.ping()
+        # Check database
+        db.execute("SELECT 1")
+        return {"status": "ready"}
+    except:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not ready"}
+        )
 ```
 
 <details>
@@ -570,15 +589,25 @@ def ready():
 ```python
 import signal
 import sys
+import time
 
 def shutdown_handler(signum, frame):
     """Handle SIGTERM from container orchestrator"""
-    # TODO:
-    # 1. Stop accepting new requests
+    print("Received SIGTERM! Initiating graceful shutdown...")
+    # 1. Stop accepting new requests (uvicorn tự xử lý, ta đánh dấu cờ not ready)
+    global is_ready
+    is_ready = False
+    
     # 2. Finish current requests
+    print("Waiting for in-flight requests to finish...")
+    time.sleep(2) # Giả lập chờ request đang dở
+    
     # 3. Close connections
+    print("Closing database and Redis connections...")
+    
     # 4. Exit
-    pass
+    print("Shutdown complete.")
+    sys.exit(0)
 
 signal.signal(signal.SIGTERM, shutdown_handler)
 ```
@@ -768,14 +797,19 @@ touch .dockerignore
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    # TODO: Define all config
-    # - PORT
-    # - REDIS_URL
-    # - AGENT_API_KEY
-    # - LOG_LEVEL
-    # - RATE_LIMIT_PER_MINUTE
-    # - MONTHLY_BUDGET_USD
-    pass
+    host: str = "0.0.0.0"
+    port: int = 8000
+    environment: str = "development"
+    debug: bool = False
+    app_name: str = "Production AI Agent"
+    app_version: str = "1.0.0"
+    openai_api_key: str = ""
+    llm_model: str = "gpt-4o-mini"
+    agent_api_key: str = "dev-key-change-me"
+    allowed_origins: list = ["*"]
+    rate_limit_per_minute: int = 20
+    daily_budget_usd: float = 5.0
+    redis_url: str = ""
 
 settings = Settings()
 ```
@@ -795,13 +829,13 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
-    # TODO
-    pass
+    return {"status": "ok", "version": settings.app_version}
 
 @app.get("/ready")
 def ready():
-    # TODO: Check Redis connection
-    pass
+    if not getattr(app.state, "is_ready", True):
+        raise HTTPException(503, "Not ready")
+    return {"ready": True}
 
 @app.post("/ask")
 def ask(
@@ -810,12 +844,15 @@ def ask(
     _rate_limit: None = Depends(check_rate_limit),
     _budget: None = Depends(check_budget)
 ):
-    # TODO: 
-    # 1. Get conversation history from Redis
-    # 2. Call LLM
-    # 3. Save to Redis
-    # 4. Return response
-    pass
+    # Lấy câu trả lời (Mock LLM)
+    answer = llm_ask(question)
+    
+    return {
+        "question": question,
+        "answer": answer,
+        "model": settings.llm_model,
+        "user_id": user_id
+    }
 ```
 
 #### Step 4: Authentication (5 phút)
@@ -826,10 +863,12 @@ def ask(
 from fastapi import Header, HTTPException
 
 def verify_api_key(x_api_key: str = Header(...)):
-    # TODO: Verify against settings.AGENT_API_KEY
-    # Return user_id if valid
-    # Raise HTTPException(401) if invalid
-    pass
+    if not x_api_key or x_api_key != settings.agent_api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
+        )
+    return x_api_key
 ```
 
 #### Step 5: Rate limiting (10 phút)
@@ -843,9 +882,17 @@ from fastapi import HTTPException
 r = redis.from_url(settings.REDIS_URL)
 
 def check_rate_limit(user_id: str):
-    # TODO: Implement sliding window
-    # Raise HTTPException(429) if exceeded
-    pass
+    now = time.time()
+    window = _rate_windows[user_id]
+    while window and window[0] < now - 60:
+        window.popleft()
+    if len(window) >= settings.rate_limit_per_minute:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
+            headers={"Retry-After": "60"},
+        )
+    window.append(now)
 ```
 
 #### Step 6: Cost guard (10 phút)
@@ -854,26 +901,58 @@ def check_rate_limit(user_id: str):
 
 ```python
 def check_budget(user_id: str):
-    # TODO: Check monthly spending
-    # Raise HTTPException(402) if exceeded
-    pass
+    if getattr(app.state, "daily_cost", 0) >= settings.daily_budget_usd:
+        raise HTTPException(
+            status_code=402, 
+            detail="Daily budget exhausted. Try tomorrow."
+        )
 ```
 
 #### Step 7: Dockerfile (5 phút)
 
 ```dockerfile
-# TODO: Multi-stage build
 # Stage 1: Builder
+FROM python:3.11-slim AS builder
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
 # Stage 2: Runtime
+FROM python:3.11-slim AS runtime
+RUN groupadd -r agent && useradd -r -g agent -d /app agent
+WORKDIR /app
+COPY --from=builder /root/.local /home/agent/.local
+COPY app/ ./app/
+COPY utils/ ./utils/
+RUN chown -R agent:agent /app
+USER agent
+ENV PATH=/home/agent/.local/bin:$PATH
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 #### Step 8: Docker Compose (5 phút)
 
 ```yaml
-# TODO: Define services
-# - agent (scale to 3)
-# - redis
-# - nginx (load balancer)
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=staging
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 ```
 
 #### Step 9: Test locally (5 phút)
